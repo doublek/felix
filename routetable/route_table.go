@@ -80,6 +80,9 @@ type RouteTable struct {
 	// dataplane is our shim for the netlink/arp interface.  In production, it maps directly
 	// through to calls to the netlink package and the arp command.
 	dataplane dataplaneIface
+
+	ctIpAddrs4 set.Set
+	ctIpAddrs6 set.Set
 }
 
 func New(interfacePrefixes []string, ipVersion uint8) *RouteTable {
@@ -117,6 +120,8 @@ func NewWithShims(interfacePrefixes []string, ipVersion uint8, nl dataplaneIface
 		pendingIfaceNameToTargets: map[string][]Target{},
 		dirtyIfaces:               set.New(),
 		dataplane:                 nl,
+		ctIpAddrs4:                set.New(),
+		ctIpAddrs6:                set.New(),
 	}
 }
 
@@ -204,6 +209,10 @@ func (r *RouteTable) Apply() error {
 		r.inSync = false
 		return UpdateFailed
 	}
+	r.dataplane.RemoveConntrackFlows(4, r.ctIpAddrs4)
+	r.dataplane.RemoveConntrackFlows(6, r.ctIpAddrs6)
+	r.ctIpAddrs4.Clear()
+	r.ctIpAddrs6.Clear()
 
 	return nil
 }
@@ -247,12 +256,19 @@ func (r *RouteTable) syncRoutesForLink(ifaceName string) error {
 
 	// The code below may add some more CIDRs to clean up before it is done, make sure we
 	// remove conntrack entries in any case.
-	defer oldCIDRs.Iter(func(item interface{}) error {
-		// Remove and conntrack entries that should no longer be there.
-		dest := item.(ip.CIDR)
-		r.dataplane.RemoveConntrackFlows(dest.Version(), dest.Addr().AsNetIP())
-		return nil
-	})
+	defer func(oldCIDRs set.Set) {
+		oldCIDRs.Iter(func(item interface{}) error {
+			// Remove and conntrack entries that should no longer be there.
+			dest := item.(ip.CIDR)
+			switch dest.Version() {
+			case 4:
+				r.ctIpAddrs4.Add(dest.Addr())
+			case 6:
+				r.ctIpAddrs6.Add(dest.Addr())
+			}
+			return nil
+		})
+	}(oldCIDRs)
 
 	// Try to get the link.  This may fail if it's been deleted out from under us.
 	link, err := r.dataplane.LinkByName(ifaceName)
