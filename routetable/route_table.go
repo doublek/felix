@@ -75,6 +75,8 @@ type RouteTable struct {
 	ifaceNameToTargets        map[string][]Target
 	pendingIfaceNameToTargets map[string][]Target
 
+	pendingConntrackCleanups map[ip.Addr]chan struct{}
+
 	inSync bool
 
 	// dataplane is our shim for the netlink/arp interface.  In production, it maps directly
@@ -122,6 +124,7 @@ func NewWithShims(interfacePrefixes []string, ipVersion uint8, nl dataplaneIface
 		dataplane:                 nl,
 		ctIpAddrs4:                set.New(),
 		ctIpAddrs6:                set.New(),
+		pendingConntrackCleanups:  map[ip.Addr]chan struct{}{},
 	}
 }
 
@@ -204,15 +207,14 @@ func (r *RouteTable) Apply() error {
 		return set.RemoveItem
 	})
 
+	r.deleteConntrackEntries()
+	r.cleanUpPendingConntrackDeletions()
+
 	if r.dirtyIfaces.Len() > 0 {
 		r.logCxt.Warn("Some interfaces still out-of sync.")
 		r.inSync = false
 		return UpdateFailed
 	}
-	r.dataplane.RemoveConntrackFlows(4, r.ctIpAddrs4)
-	r.dataplane.RemoveConntrackFlows(6, r.ctIpAddrs6)
-	r.ctIpAddrs4.Clear()
-	r.ctIpAddrs6.Clear()
 
 	return nil
 }
@@ -266,6 +268,8 @@ func (r *RouteTable) syncRoutesForLink(ifaceName string) error {
 			case 6:
 				r.ctIpAddrs6.Add(dest.Addr())
 			}
+			done := make(chan struct{})
+			r.pendingConntrackCleanups[dest.Addr()] = done
 			return nil
 		})
 	}(oldCIDRs)
@@ -339,6 +343,9 @@ func (r *RouteTable) syncRoutesForLink(ifaceName string) error {
 				Protocol:  syscall.RTPROT_BOOT,
 				Scope:     netlink.SCOPE_LINK,
 			}
+			// In case this IP is being re-used, wait for any previous conntrack entry
+			// to be cleaned up.  (No-op if there are no pending deletes.)
+			r.waitForPendingConntrackDeletion(cidr.Addr())
 			if err := r.dataplane.RouteAdd(&route); err != nil {
 				logCxt.WithError(err).Warn("Failed to add route")
 				updatesFailed = true
@@ -361,6 +368,56 @@ func (r *RouteTable) syncRoutesForLink(ifaceName string) error {
 	}
 
 	return nil
+}
+
+func (r *RouteTable) deleteConntrackEntries() {
+	go func() {
+		defer r.ctIpAddrs4.Clear()
+		defer r.ctIpAddrs6.Clear()
+		defer r.ctIpAddrs4.Iter(func(item interface{}) error {
+			ipAddr := item.(ip.Addr)
+			if done, ok := r.pendingConntrackCleanups[ipAddr]; ok {
+				close(done)
+				log.WithField("ip", ipAddr).Debug("Deleted conntrack entries")
+			}
+			return nil
+		})
+		defer r.ctIpAddrs6.Iter(func(item interface{}) error {
+			ipAddr := item.(ip.Addr)
+			if done, ok := r.pendingConntrackCleanups[ipAddr]; ok {
+				close(done)
+				log.WithField("ip", ipAddr).Debug("Deleted conntrack entries")
+			}
+			return nil
+		})
+		r.dataplane.RemoveConntrackFlows(r.ctIpAddrs6, r.ctIpAddrs6)
+	}()
+}
+
+// cleanUpPendingConntrackDeletions scans the pendingConntrackCleanups map for completed entries and removes them.
+func (r *RouteTable) cleanUpPendingConntrackDeletions() {
+	for ipAddr, c := range r.pendingConntrackCleanups {
+		select {
+		case <-c:
+			log.WithField("ip", ipAddr).Debug(
+				"Background goroutine finished deleting conntrack entries")
+			delete(r.pendingConntrackCleanups, ipAddr)
+		default:
+			log.WithField("ip", ipAddr).Debug(
+				"Background goroutine yet to finish deleting conntrack entries")
+			continue
+		}
+	}
+}
+
+// waitForPendingConntrackDeletion waits for any pending conntrack deletions (if any) for the given IP to complete.
+func (r *RouteTable) waitForPendingConntrackDeletion(ipAddr ip.Addr) {
+	if c := r.pendingConntrackCleanups[ipAddr]; c != nil {
+		log.WithField("ip", ipAddr).Info("Waiting for pending conntrack deletion to finish")
+		<-c
+		log.WithField("ip", ipAddr).Info("Done waiting for pending conntrack deletion to finish")
+		delete(r.pendingConntrackCleanups, ipAddr)
+	}
 }
 
 // filterErrorByIfaceState checks the current state of the interface; if it's down or gone, it

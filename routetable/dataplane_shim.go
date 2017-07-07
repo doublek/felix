@@ -32,7 +32,7 @@ type dataplaneIface interface {
 	RouteAdd(route *Route) error
 	RouteDel(route *Route) error
 	AddStaticArpEntry(cidr ip.CIDR, destMAC net.HardwareAddr, ifaceName string) error
-	RemoveConntrackFlows(ipVersion uint8, ipAddrs set.Set)
+	RemoveConntrackFlows(ipV4Addrs set.Set, ipV6Addrs set.Set)
 }
 
 type realDataplane struct {
@@ -66,8 +66,8 @@ func (r realDataplane) AddStaticArpEntry(cidr ip.CIDR, destMAC net.HardwareAddr,
 	return cmd.Run()
 }
 
-func (r realDataplane) RemoveConntrackFlows(ipVersion uint8, ipAddrs set.Set) {
-	r.conntrack.RemoveConntrackFlows(ipVersion, ipAddrs)
+func (r realDataplane) RemoveConntrackFlows(ipV4Addrs set.Set, ipV6Addrs set.Set) {
+	r.conntrack.RemoveConntrackFlows(ipV4Addrs, ipV6Addrs)
 }
 
 var _ dataplaneIface = realDataplane{}

@@ -15,62 +15,73 @@
 package conntrack
 
 import (
-	"syscall"
+	"bytes"
+	"net"
+	"os/exec"
+	"strings"
 
 	log "github.com/Sirupsen/logrus"
-	"github.com/vishvananda/netlink"
 
-	"github.com/projectcalico/felix/ip"
 	"github.com/projectcalico/felix/set"
 )
 
-type AnyIPMatchConntrackFilter struct {
-	ips set.Set
-}
-
-func (f *AnyIPMatchConntrackFilter) MatchConntrackFlow(flow *netlink.ConntrackFlow) (match bool) {
-	f.ips.Iter(func(item interface{}) error {
-		ipB := item.(ip.Addr)
-		ipAddr := ipB.AsNetIP()
-		if ipAddr.Equal(flow.Forward.SrcIP) ||
-			ipAddr.Equal(flow.Forward.DstIP) ||
-			ipAddr.Equal(flow.Reverse.SrcIP) ||
-			ipAddr.Equal(flow.Reverse.DstIP) {
-			match = true
-			return set.StopIteration
-		}
-		return nil
-	})
-	return
-}
+const numRetries = 3
 
 type Conntrack struct {
+	newCmd newCmd
 }
 
 func New() *Conntrack {
-	return &Conntrack{}
+	return NewWithCmdShim(func(name string, arg ...string) CmdIface {
+		return exec.Command(name, arg...)
+	})
 }
 
-func (c Conntrack) RemoveConntrackFlows(ipVersion uint8, ipAddrs set.Set) {
-	if ipAddrs.Len() == 0 {
-		return
+// NewWithCmdShim is a test constructor that allows for shimming exec.Command.
+func NewWithCmdShim(newCmd newCmd) *Conntrack {
+	return &Conntrack{
+		newCmd: newCmd,
 	}
-	var family netlink.InetFamily
-	switch ipVersion {
-	case 4:
-		family = syscall.AF_INET
-	case 6:
-		family = syscall.AF_INET6
-	default:
-		log.WithField("version", ipVersion).Panic("Unknown IP version")
-	}
-	log.Infof("Removing conntrack flows from table v%v for ips %v", ipVersion, ipAddrs)
-	filter := &AnyIPMatchConntrackFilter{ips: ipAddrs}
-	numFlows, err := netlink.ConntrackDeleteFilter(netlink.ConntrackTable, family, filter)
-	if err != nil {
-		log.Errorf("error when removing conntrack flows %v", err)
-	} else {
-		//TODO(doublek): Remove this log and else path.
-		log.Infof("Successfully removed %v conntrack flows", numFlows)
+}
+
+type newCmd func(name string, arg ...string) CmdIface
+
+type CmdIface interface {
+	CombinedOutput() ([]byte, error)
+}
+
+func (c Conntrack) RemoveConntrackFlows(ipV4Addr set.Set, ipV6Addr set.Set) {
+	buf := new(bytes.Buffer)
+	ipV4Addr.Iter(func(item interface{}) error {
+		ip := item.(net.IP)
+		buf.WriteString(" --ipv4 ")
+		buf.WriteString(ip.String())
+		return nil
+	})
+	ipV6Addr.Iter(func(item interface{}) error {
+		ip := item.(net.IP)
+		buf.WriteString(" --ipv6 ")
+		buf.WriteString(ip.String())
+		return nil
+	})
+	log.Info("Removing conntrack flows")
+	// Retry a few times because the conntrack command seems to fail at random.
+	for retry := 0; retry <= numRetries; retry += 1 {
+		cmd := c.newCmd("conntrack-delete", buf.String())
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			log.Debug("Successfully removed conntrack flows.")
+			break
+		}
+		if strings.Contains(string(output), "0 flow entries") {
+			// Success, there were no flows.
+			log.Debug("No IP wasn't in conntrack")
+			break
+		}
+		if retry == numRetries {
+			log.WithError(err).Error("Failed to remove conntrack flows after retries.")
+		} else {
+			log.WithError(err).Warn("Failed to remove conntrack flows, will retry...")
+		}
 	}
 }
