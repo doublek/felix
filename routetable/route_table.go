@@ -390,7 +390,7 @@ func (r *RouteTable) deleteConntrackEntries() {
 			}
 			return nil
 		})
-		r.dataplane.RemoveConntrackFlows(r.ctIpAddrs6, r.ctIpAddrs6)
+		r.dataplane.RemoveConntrackFlows(r.ctIpAddrs4, r.ctIpAddrs6)
 	}()
 }
 
