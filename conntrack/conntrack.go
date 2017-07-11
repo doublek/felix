@@ -15,13 +15,12 @@
 package conntrack
 
 import (
-	"bytes"
-	"net"
 	"os/exec"
 	"strings"
 
 	log "github.com/Sirupsen/logrus"
 
+	"github.com/projectcalico/felix/ip"
 	"github.com/projectcalico/felix/set"
 )
 
@@ -51,23 +50,27 @@ type CmdIface interface {
 }
 
 func (c Conntrack) RemoveConntrackFlows(ipV4Addr set.Set, ipV6Addr set.Set) {
-	buf := new(bytes.Buffer)
+	if ipV4Addr.Len() == 0 && ipV6Addr.Len() == 0 {
+		log.Info("Skipping removing conntrack flows - empty sets")
+		return
+	}
+	args := make([]string, 0, ipV4Addr.Len()+ipV6Addr.Len())
 	ipV4Addr.Iter(func(item interface{}) error {
-		ip := item.(net.IP)
-		buf.WriteString(" --ipv4 ")
-		buf.WriteString(ip.String())
+		ip := item.(ip.Addr)
+		args = append(args, "--ipv4")
+		args = append(args, ip.String())
 		return nil
 	})
 	ipV6Addr.Iter(func(item interface{}) error {
-		ip := item.(net.IP)
-		buf.WriteString(" --ipv6 ")
-		buf.WriteString(ip.String())
+		ip := item.(ip.Addr)
+		args = append(args, "--ipv6")
+		args = append(args, ip.String())
 		return nil
 	})
 	log.Info("Removing conntrack flows")
 	// Retry a few times because the conntrack command seems to fail at random.
 	for retry := 0; retry <= numRetries; retry += 1 {
-		cmd := c.newCmd("conntrack-delete", buf.String())
+		cmd := c.newCmd("conntrack-delete", args...)
 		output, err := cmd.CombinedOutput()
 		if err == nil {
 			log.Debug("Successfully removed conntrack flows.")
